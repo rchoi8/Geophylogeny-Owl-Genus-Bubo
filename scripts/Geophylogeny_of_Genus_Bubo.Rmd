@@ -1,0 +1,396 @@
+---
+title: "BINF 6210 Software Tools: Assignment 2"
+output: html_document
+date: "2024-10-18"
+author: "Rebecca Choi"
+---
+# Packages used
+```{r message=FALSE, warning=FALSE, include=FALSE}
+# loaded libraries
+library(tidyverse)
+library(rentrez)
+library(BiocManager)
+library(Biostrings)
+library(seqinr)
+library(DECIPHER)
+library(msa)
+library(ggtree)
+library(ape)
+library(sf)
+library(maps)
+library(ggmap)
+library(phytools)
+library(ggimage)
+library(cowplot)
+library(styler)
+library(dendextend)
+library(viridis)
+library(rphylopic)
+```
+
+#Introduction 
+
+    Horned owls and eagle-owls, belonging to the genus Bubo, are crucial for ecological balance as apex predators that regulate prey populations and maintain biodiversity (Ostrow et al., 2023). They are indicators of environmental health, reflecting ecosystem integrity and signaling issues like habitat degradation (Ostrow et al., 2023). However, according to the International Union for Conservation of Nature (IUCN) Red List of Threatened Species, several Bubo species, including the Eurasian eagle-owl (Bubo bubo), are declining (IUCN, 2024). Various geographical factors significantly influence the survival and conservation strategies for these species (Cartron et al., 2023). For instance, Bubo species inhabiting similar ecological niches may face common threats from habitat destruction and climate change, while those in distinct regions may encounter unique challenges requiring tailored conservation approaches (Cartron et al., 2023). 
+    Understanding whether sister species co-occur in similar or different geographical regions can reveal patterns of ecological resilience or vulnerability, guiding resource allocation and conservation management strategies (León-Ortega & González-Wangüemert, 2015). Such investigations can also provide insight on the evolutionary processes that contribute to varying conservation statuses among Bubo species (IUCN, 2024; León-Ortega & González-Wangüemert, 2015). These insights would further inform phylogenetic studies and promote biodiversity preservation (León-Ortega & González-Wangüemert, 2015). Therefore, our study aims to investigate whether sister species in the Bubo genus inhabit similar or different geographic regions. We hypothesize that Bubo sister species would reside in similar areas due to their ecological requirements and habitat adaptations, which promote sympatric distribution and facilitate coexistence while minimizing resource competition (Brambilla et al., 2010). Ultimately, our research can enhance conservation planning by identifying critical habitats and priority areas for intervention, supporting effective management of Bubo species in the face of ongoing environmental change. 
+
+
+
+# Query Search and ID Fetching
+```{r}
+# To allow for the storage of large search results from NCBI, a for-loop is used to collect the search results in batches. So whether the query is a small or large request, we can smoothly collect the data.
+
+# Data inputs for Cytochrome c oxidase I have been referred to as COI, CO1 or COX1 in the NCBI database so our request includes any of these. 
+# This Bubo data was queried on Oct 23, 2024
+query <- 'Bubo[ORGN] AND (COI[Gene] OR CO1[Gene] OR COX1[Gene])'
+
+# We created variables and vectors to be used in the for-loop (bubo_search, total_count, and batch_size) or to store data (all_ids) for the for-loop. By creating these variables and vectors, we can easily make changes to them to adjust for future queries that may have different conditions. We saved our search using web history to allow for large requests.
+bubo_search <- entrez_search(db = "nuccore", term = query, use_history = TRUE)
+total_count <- bubo_search$count
+all_ids <- c()
+batch_size <- 100  
+
+# Checked for the number of IDs found our search. # 82 IDs
+print(total_count)
+
+# This for-loop collects all the sequence IDs of our query and stores them in our all_ids vector.
+for (start in seq(0, total_count, by = batch_size)) {
+    search_results <- entrez_search(db = "nuccore", term = query, retmax = batch_size, retstart = start)
+    all_ids <- c(all_ids, search_results$ids)}
+
+# Checked to make sure we have the same number of IDs found in our above search # YES, 82 ids
+length(all_ids)
+
+
+
+```
+
+
+# Sequence Fetching
+```{r}
+# We created a variable to store all the sequences that we will fetch in a for-loop from our search query.
+all_seq <- ""
+
+# Like the above process, we used a for-loop and web history to allow for large requests to fetch the sequences in batches of 100 
+for (start in seq(0, total_count, by = batch_size)) {
+    batch_sequences <- entrez_fetch(
+        db = "nuccore", 
+        web_history = bubo_search$web_history, 
+        rettype = "fasta", 
+        retmode = "text", 
+        retstart = start, 
+        retmax = batch_size)
+    
+    # Appended the batch to the all_seq variable
+    all_seq <- paste(all_seq, batch_sequences, sep = "\n")}
+
+
+# We wrote the fetched sequences to a FASTA file
+fasta_filepath <- "/Users/rchoi/Desktop/MBinf/Software Tools/Assignments/A2/data/bubo_seq.fasta" # alternate pathway: "../data/bubo_seq.fasta"
+write(all_seq, fasta_filepath)
+
+# Read the FASTA file as a DNAStringSet and converted it to data frame, formatting it with our collected IDs and sequences.
+bubo_string <- readDNAStringSet(fasta_filepath)
+
+dfbubo_unfiltered <- data.frame(
+    ID = paste(all_ids),  
+    Sequence = paste(bubo_string),
+    stringsAsFactors = FALSE)
+
+```
+
+# Sequence Data Quality Check
+```{r}
+# We created a column to determine the sequence lengths.
+dfbubo_unfiltered$Sequence_Length <- nchar(dfbubo_unfiltered$Sequence)
+
+# Checked for the median and distribution of sequence lengths, dimension of our data frame, and NAs
+summary(dfbubo_unfiltered) #82 sequences and lengths between 469-19488 which is a very large range and means we need to filter for homogenous sequences 
+# The median is 718 nucleotides so we noted that our final sequences should be around this median to obtain similar homogenous sequences.
+unique(is.na(dfbubo_unfiltered$Sequence)) # FALSE result, meaning no NAs present
+```
+
+# Histogram of Sequence Length Distribution
+```{r}
+# We made variables to define our acceptance of internal Ns in our sequences and sequence length variability for our analysis.
+missing_data <- 0.01
+length_var <- 60
+
+# We removed all leading and trailing N values and missing data in our sequences, filtered to keep only sequences that have <= 1% of internal Ns, and filtered to accept only sequence lengths that are within a certain number of nucleotides (defined with length_var) of the median sequence length. This makes sure that the sequences we are working with are homogenous/similar.
+dfbubo <- dfbubo_unfiltered %>%
+  mutate(Sequence = str_remove_all(Sequence, "^N+|N+$|-")) %>%
+  filter(str_count(Sequence, "N") <= (missing_data * str_count(Sequence))) %>%
+  filter(str_count(Sequence) <= median(str_count(Sequence)) + length_var & str_count(Sequence) >= median(str_count(Sequence)) - length_var)
+
+# We looked at a summary of our dataframe again to see the number of sequences and sequence lengths remaining after the above cleaning.
+summary(dfbubo) # 25 sequences and sequence lengths are between 663-748 nucleotides
+
+
+# We then created a histogram to check the distribution of sequence lengths.
+ggplot(dfbubo, aes(x = Sequence_Length)) +
+  geom_histogram(binwidth = 10, fill = "skyblue", color = "dimgrey", alpha = 0.7) +
+  labs(title = "Distribution of Bubo (Genus) DNA Sequence Lengths",
+       x = "Sequence Length",
+       y = "Frequency") +
+  theme_minimal() +
+   theme( plot.title = element_text(hjust = 0.5, face = "bold"),
+          panel.grid.major.x = element_blank(), 
+          panel.grid.minor.x = element_blank())
+
+
+```
+## With our new range, 650 and 750 nucleotides in sequence length provided us with the sequences that are close to the median of all sequences from the Bubo genus and are homologous or similar with each other. The most frequent sequences lengths were between 675 and 700 nucleotides.
+
+# Fetching Species Names and Merging with Sequence Data
+```{r} 
+# The species names of the sequences can be retrieved using the metadata from our query search. Like the above processes, we used a for-loop and web history to allow for large requests to fetch the species names from our query in batches of 100. 
+
+# We first created an empty list to store the metadata for the IDs.
+metadata_list <- list()
+
+# We fetched the metadata in batches of 100 using web history.
+for (start in seq(0, total_count, by = batch_size)) {
+    batch_metadata <- entrez_summary(
+        db = "nuccore",
+        web_history = bubo_search$web_history,
+        retstart = start,
+        retmax = batch_size)
+    
+    # Appended the batch of metadata to metadata_list
+    metadata_list <- c(metadata_list, batch_metadata)}
+
+# We created a dataframe to organize the metadata into a structured format.
+metadata_df <- data.frame(
+    ID = sapply(metadata_list, function(x) x$uid),
+    Organism = sapply(metadata_list, function(x) x$organism),
+    stringsAsFactors = FALSE
+)
+
+# We wanted to merge our metadata_df that has the species names with dfbubo that has the sequence data via their shared ID column. We checked that the data frames have their corresponding columns including ID. 
+head(metadata_df)
+head(dfbubo) # Yes, they both have the correct columns.
+
+# We then combined the species name metadata data frame with the sequences data frame.
+seq_spec <- merge(metadata_df, dfbubo, by.x = "ID", by.y = "ID", all.x = TRUE)
+
+# We checked again that the merge was successful, so now this dataframe has the ID, Organism, Sequence, and Sequence Length columns which is what we expected.
+summary(seq_spec)
+head(seq_spec)
+# We check if there are any missing sequences after the merge.
+  # 25 missing sequences which we will filter out
+sum(!is.na(seq_spec$Sequence))
+
+# We filtered out missing sequences after the merge and kept species names to 2 names for standardization. We removed the Sequence_Length column since we have all the sequences we need now.
+seq_spec <- seq_spec %>%
+  filter(!is.na(Sequence)) %>%
+  mutate(Organism = word(Organism, 1L, 2L)) %>%
+  select(-Sequence_Length)
+  
+```
+
+# Aligning Sequences
+```{r}
+# We converted the Sequence column of the seq$spec to a DNAStringSet to be suitable for Bioconductor packages. 
+seq_spec$Sequence <- DNAStringSet(seq_spec$Sequence)
+
+#We wanted to assign the names of the sequences based on the Organisms, which allows each sequence to be identified with its corresponding organism. We first checked the unique organisms in seq_spec to make sure there are no NAs or incorrect species present.
+unique(seq_spec$Organism)
+names(seq_spec$Sequence) <- seq_spec$Organism
+
+# We aligned the DNA sequences in seq_spec$Sequence using the MUSCLE algorithm and stored the aligned sequences in a new DNAStringSet called bubo_aligned.
+bubo_aligned <- DNAStringSet(muscle::muscle(seq_spec$Sequence))
+
+# Checked the aligned sequences for any excessive Ns, for example, in a browser window.
+BrowseSeqs(bubo_aligned)
+
+```
+
+# Phylogenetic Tree of Bubo species
+```{r}
+# We extracted the aligned sequences corresponding to each species name and stored them in speciesname_seq variables.
+bubo_lacteus_seq <- bubo_aligned[grepl("Bubo lacteus", names(bubo_aligned))]
+bubo_virginianus_seq <- bubo_aligned[grepl("Bubo virginianus", names(bubo_aligned))]
+bubo_bubo_seq <- bubo_aligned[grepl("Bubo bubo", names(bubo_aligned))]
+bubo_magellanicus_seq <- bubo_aligned[grepl("Bubo magellanicus", names(bubo_aligned))]
+bubo_scandiacus_seq <- bubo_aligned[grepl("Bubo scandiacus", names(bubo_aligned))]
+bubo_sumatranus_seq <- bubo_aligned[grepl("Bubo sumatranus", names(bubo_aligned))]
+bubo_nipalensis_seq <- bubo_aligned[grepl("Bubo nipalensis", names(bubo_aligned))]
+bubo_philippensis_seq <- bubo_aligned[grepl("Bubo philippensis", names(bubo_aligned))]
+bubo_blakistoni_seq <- bubo_aligned[grepl("Bubo blakistoni", names(bubo_aligned))]
+
+# We wanted to create consensus sequences for each species before organizing them into a phylogenetic tree, but this requires each species to have at least more than one sequence. So, we checked for the number of unique sequences per species.
+length(unique(bubo_lacteus_seq)) #1 sequence
+length(unique(bubo_virginianus_seq)) #3 sequences
+length(unique(bubo_bubo_seq)) #6
+length(unique(bubo_magellanicus_seq)) #2
+length(unique(bubo_scandiacus_seq)) #5
+length(unique(bubo_sumatranus_seq)) #1
+length(unique(bubo_nipalensis_seq)) #1
+length(unique(bubo_philippensis_seq)) #1
+length(unique(bubo_blakistoni_seq)) #5
+# Hence, four species are each represented with one sequence in the dataset and do not need a consensus sequence to be created.
+
+# The remaining species have multiple sequences so we created consensus sequences for them.
+cons_virginianus <- msaConsensusSequence(msa(bubo_virginianus_seq))
+cons_bubo <- msaConsensusSequence(msa(bubo_bubo_seq))
+cons_magellanicus <- msaConsensusSequence(msa(bubo_magellanicus_seq))
+cons_scandiacus <- msaConsensusSequence(msa(bubo_scandiacus_seq))
+cons_blakistoni <- msaConsensusSequence(msa(bubo_blakistoni_seq))
+
+# In our environment we can see that some consensus sequences have gaps in nucleotides seen as "?" so we search for which species consensus sequences have those.
+grep('\\?', cons_virginianus)
+grep('\\?', cons_bubo) #1 ?
+grep('\\?', cons_magellanicus) #1 ?
+grep('\\?', cons_scandiacus)   
+grep('\\?', cons_blakistoni)
+# We see that two sequences (cons_bubo and cons_magellanicus) have "?" present so we will replace those with "N" instead to make the sequence more usable.
+cons_bubo <- gsub('\\?', 'N', cons_bubo)
+cons_magellanicus <- gsub('\\?', 'N', cons_magellanicus)
+
+# We then combined all the consensus sequences and unique sequences into a single DNAStringSet called cons_seqs and assigned names to the sequences by their corresponding species name.
+cons_seqs <- DNAStringSet(c(bubo_lacteus_seq, bubo_sumatranus_seq, bubo_nipalensis_seq, bubo_philippensis_seq, cons_virginianus, cons_bubo, cons_magellanicus, cons_scandiacus, cons_blakistoni))
+
+names(cons_seqs) <- c("Bubo lacteus", "Bubo sumatranus", "Bubo nipalensis", "Bubo philippensis", "Bubo virginianus", "Bubo bubo", "Bubo magellanicus", "Bubo scandiacus", "Bubo blakistoni")
+
+# cons_seqs is converted into a DNA bin which is a binary format that is suitable for distance calculations. We need to do this in order to calculate a distance matrix in our next step.
+DNAbin_cons_seqs <- as.DNAbin(cons_seqs)
+
+# We created a distance matrix from the binary sequences using the TN93 model since this is a method to estimate evolutionary distance and we want a phylogenetic tree for the Bubo genus. We used the documentation written by Paradis (2024) to support this step.
+dis_matrix_cons_seqs <- dist.dna(DNAbin_cons_seqs, model = "TN93", as.matrix = TRUE)
+
+# This built a phylogenetic tree based on the distance matrix using single linkage clustering. 
+tree_cons_seqs <- DECIPHER::TreeLine(myDistMatrix = dis_matrix_cons_seqs,
+                                   method = "single",
+                                   cutoff = 0.03,
+                                   showPlot = FALSE,
+                                   type = "both",
+                                   verbose = TRUE)
+
+# Since we would like more options to customize the phylogenetic tree than what the DECIPHER::TreeLine provides, we first convert the Treeline output into a phylogenetic tree object.
+phylo_cons_seqs <- as.phylo(tree_cons_seqs[[2]])
+
+# We set the tip labels of the phylogenetic tree to short forms for easier visualization.
+bubo_fullname <- c("Bubo lacteus", "Bubo sumatranus", "Bubo nipalensis", "Bubo philippensis", "Bubo virginianus", "Bubo bubo", "Bubo magellanicus", "Bubo scandiacus", "Bubo blakistoni")
+bubo_short <- c("B.lacteus", "B.sumatranus", "B.nipalensis", "B.philippensis", "B.virginianus", "B.bubo", "B.magellanicus", "B.scandiacus", "B.blakistoni")
+phylo_cons_seqs$tip.label <- bubo_short
+plot(phylo_cons_seqs,
+     main = "Phylogenetic Tree of Horned Owls and Eagle-Owls (Bubo genus)", 
+     cex = 0.85, 
+     edge.color = "darkblue",
+     edge.width = 1.5,
+     tip.color = "purple",
+     label.offset = 0.0003)
+
+```
+## B.sumatranus and B.nipalensis, B.philippensis and B.blakistoni, and B.virginianus and B.magellanicus are three pairs of sister species that are the most closely related to each other in the Bubo genus. B.lacteus is the most distantly related species than the other Bubo species. We can be confident in the organization of our phylogenetic tree since it aligns with the phylogenetic distribution of Bubo species studied by Omote et al. (2013).
+
+
+# Obtaining and Cleaning Geographical Data of Bubo
+```{r}
+# We read in the BOLD geographical data of the Bubo genus. The data was obtained on October 18, 2024.
+# Data could also be obtained here: https://www.boldsystems.org/index.php/API_Public/combined?taxon=Bubo&format=tsv
+geo_bold <- read_tsv(file = "/Users/rchoi/Desktop/MBinf/Software Tools/Assignments/A2/data/geo_bubo.txt", show_col_types = FALSE)
+
+# We checked for any NAs/missing data in the columns we would like to filter for.
+  # TRUE for all columns, meaning we will need to remove these missing datapoints.
+geo_bold %>%
+  select(species_name, country, lat, lon) %>%
+  summarise(
+    species_name_na = any(is.na(species_name)),
+    country_na = any(is.na(country)),
+    lat_na = any(is.na(lat)),
+    lon_na = any(is.na(lon))
+  ) 
+
+# We selected for the species name, country, latitude, and longitude columns which we will need to map the species datapoints. We created a column with species names kept to two words and removed the observations with missing data. Since we made a new column of species names called Organism, we dropped the original species_name column.
+geo_bubo <- geo_bold %>%
+  select("species_name", "country","lat", "lon") %>%
+  mutate(Organism = word(species_name, 1L, 2L)) %>%
+  na.omit("NA") %>%
+  select(-species_name)
+
+# We checked for which species in the dataset with aligned sequences (seq_spec) are also present in the geographical dataset extracted from BOLD (df). This helps us filter for what species are present in both datasets and prevent any missing data or species with no latitude/longitude points later when we map projected points from our phylogenetic tree. We could compare these dataframes since they had the same original naming conventions of the full species names.
+(seq_spec$Organism %>% unique()) %in% (geo_bold$species_name %>% unique()) # FALSE for the second last value in seq_spec$Organism
+
+print(unique(seq_spec$Organism)) # "Bubo philippensis" does not have latitude/longitude values in the BOLD database so we can expect that no points will be shown on the final map.
+
+
+# In the geographical dataset, we filtered for the relevant Bubo species and recoded their names to the same short forms as the species in our phylogenetic tree.
+geo_bubo <- geo_bubo %>%
+  filter(Organism %in% c("Bubo lacteus", "Bubo sumatranus", "Bubo nipalensis", "Bubo virginianus", "Bubo bubo", "Bubo magellanicus", "Bubo scandiacus", "Bubo blakistoni")) %>%
+  mutate(Organism = recode(Organism, "Bubo lacteus" = "B.lacteus", 
+                   "Bubo sumatranus" = "B.sumatranus", 
+                   "Bubo nipalensis" = "B.nipalensis", 
+                   "Bubo virginianus" = "B.virginianus", 
+                   "Bubo bubo" = "B.bubo", 
+                   "Bubo magellanicus" = "B.magellanicus", 
+                   "Bubo scandiacus" = "B.scandiacus", 
+                   "Bubo blakistoni" = "B.blakistoni")) %>% 
+  distinct(lat, lon, Organism, .keep_all = TRUE) # Removed any redundant observations that have the same latitude, longitude, and species name since we do not need to map the same species in the same locations
+
+sum(is.na(geo_bubo)) # Final check for any NAs since this is our final geographical dataset before mapping. # Result is 0 NAs
+
+
+```
+
+# Geophylogeny of Bubo species
+```{r, echo=FALSE}
+# Since we wanted to use the phylo.to.map function which requires the geographical data to be a matrix, we converted the latitude and longitude columns into a matrix and the row names as the organisms names. We then organized the matrix in alphabetical order according to the organism names.
+matrix_geo_bubo <- as.matrix(geo_bubo[,c("lat","lon")])
+rownames(matrix_geo_bubo) <- geo_bubo$Organism
+matrix_geo_bubo <- matrix_geo_bubo[order(rownames(matrix_geo_bubo), decreasing = FALSE), ]
+
+# We created a colour palette for the species in the phylogenetic tree so each tip is a different colour.
+colours <- setNames(sample(rainbow(n=Ntip(phylo_cons_seqs))), phylo_cons_seqs$tip.label)
+sorted_labels <- sort(names(colours))
+sorted_colours <- colours[sorted_labels]
+
+# Using the phylo.to.map function, we created an object that integrated the phylogenetic tree (phylo_cons_seqs) with the geographical data (matrix_geo_bubo).
+bubo_geophy_obj <- phylo.to.map(phylo_cons_seqs, matrix_geo_bubo, plot = FALSE)
+# We adjusted the outer margin of the plot to accommodate the size of our title in the final plot
+par(oma = c(0, 0, 1, 0))
+
+# We created and customized the final plot with the projected Bubo phylogeny onto a map.
+bubo_plot <- plot(bubo_geophy_obj, colors = colours, ftype = "i", fsize = 0.7, xlim = c(-180, 180), tip.color = colours)
+title("Phylogeny of Bubo (Genus) Species and Where They are Found", cex.main = 0.8, line = -0.48)  
+
+# This code was adapted from Revell (2019).
+```
+## Sister species B. virginianus and B. magellanicus were found in a similar region around Argentina. Sister species B. sumatranus and B. nipalensis were both located in Thailand. Sister species B. blakistoni and B. philippensis could not be compared since B. philippensis did not have geographical data points. The most distantly related species B. lacteus was in a different region than the other species since it was only found in Africa and was the only Bubo species in Africa as well.
+
+
+# Discussion
+
+    Through our exploration, the results aligned with our hypothesis that Bubo sister species live in similar geographic regions, as seen with B. virginianus (great horned owl) and B. magellanicus (lesser horned owl) located around Argentina, for example. This distribution may be attributed to shared ecological preferences, such as similar hunting strategies and habitat requirements which allow these species to thrive in overlapping territories (Ibarra et al., 2014). Additionally, their adaptation to various prey types and environmental conditions facilitates coexistence, reducing direct competition and promoting resource partitioning (Grossman et al., 2008). These factors create a stable ecological niche that enables Bubo sister species to coexist in the same geographic regions (Cartron et al., 2023; Pigot et al., 2018). By recognizing the ecological interdependence of these sister species, conservation strategies can be tailored to support the resilience of owl populations in changing environments (León-Ortega & González-Wangüemert, 2015).
+    Specific drawbacks in our study include limited observations for some sister species. For example, B. nipalensis (spot-bellied eagle-owl) and B. sumatranus (barred eagle-owl) each had only one sequence and one geographic point after filtering, indicating they were both found in Thailand. While this supports our hypothesis, additional observations might reveal that they are more commonly found in distinct locations, reducing our confidence in the conclusion that Bubo sister species inhabit similar regions. A future study could incorporate sequences and geographical data from additional databases to expand our sample size and increase our confidence in whether the results support our hypothesis or not. Another limitation is that we did not account for the temporal scope of our data. For instance, if observations for B. nipalensis and B. sumatranus were taken during a specific season or year, we might misrepresent their habitat preferences, leading to the incorrect conclusion that these species occupy similar regions when they may actually have distinct seasonal distributions. To address this, future research should include geographical data of Bubo species across multiple seasons and years to better capture the full range of temporal distributions and provide a clearer understanding of geographic variability among sister species.
+
+
+# Acknowledgements
+
+    I am thankful for Revell (2019) and his blog for developing the packages and code for the geophylogeny plot. I also thank Frances Bonafe and Derick Liang for supporting me when troubleshooting the geophylogeny plot. 
+
+
+# References
+
+[IUCN] Bubo search. IUCN Red List of Threatened Species. (n.d.). https://www.iucnredlist.org/search?query=bubo&searchType=species 
+
+Brambilla, M., Bassi, E., Ceci, C., & Rubolini, D. (2010). Environmental factors affecting patterns of distribution and co-occurrence of two competing raptor species. Ibis (London, England), 152(2), 310–322. https://doi.org/10.1111/j.1474-919X.2009.00997.x
+
+Cartron, J.-L. E., Triepke, F. J., Stahlecker, D. W., Arsenault, D. P., Ganey, J. L., Hathcock, C. D., Thompson, H. K., Cartron, M. C., & Calhoun, K. C. (2023). Climate Change Habitat Model Forecasts for Eight Owl Species in the Southwestern US. Animals (Basel), 13(24), 3770-. https://doi.org/10.3390/ani13243770
+
+Grossman, S. R., Hannon, S. J., & Sánchez-Azofeifa, A. (2008). Responses of Great Horned Owls (Bubo virginianus), Barred Owls (Strix varia), and Northern Saw-whet Owls (Aegolius acadicus) to forest cover and configuration in an agricultural landscape in Alberta, Canada. Canadian Journal of Zoology, 86(10), 1165–1172. https://doi.org/10.1139/Z08-095
+
+Ibarra, J. T., Martin, K., Drever, M. C., & Vergara, G. (2014). Occurrence patterns and niche relationships of sympatric owls in South American temperate forests: A multi-scale approach. Forest Ecology and Management, 331, 281–291. https://doi.org/10.1016/j.foreco.2014.08.027
+
+León-Ortega, M., & González-Wangüemert, M. (2015). Characterization of 10 new tetranucleotide microsatellite markers for the European eagle owl, Bubo bubo: Useful tools for conservation strategies. Biochemical Systematics and Ecology, 63, 109–112. https://doi.org/10.1016/j.bse.2015.10.003
+
+Omote, K., Nishida, C., Dick, M. H., & Masuda, R. (2013). Limited phylogenetic distribution of a long tandem-repeat cluster in the mitochondrial control region in Bubo (Aves, Strigidae) and cluster variation in Blakiston’s fish owl (Bubo blakistoni). Molecular Phylogenetics and Evolution, 66(3), 889–897. https://doi.org/10.1016/j.ympev.2012.11.015
+
+Ostrow, E. N., DeCicco, L. H., & Moyle, R. G. (2023). Range-wide phylogenomics of the Great Horned Owl ( Bubo virginianus ) reveals deep north-south divergence in northern Peru. PeerJ (San Francisco, CA), 11, e15787–e15787. https://doi.org/10.7717/peerj.15787
+
+Paradis, E. (2024, May 29). Dist.dna: Pairwise distances from DNA sequences in ape: Analyses of phylogenetics and evolution. R Package Documentation. https://rdrr.io/cran/ape/man/dist.dna.html 
+
+Pigot, A. L., Jetz, W., Sheard, C., & Tobias, J. A. (2018). The macroecological dynamics of species coexistence in birds. Nature Ecology & Evolution, 2(7), 1112–1119. https://doi.org/10.1038/s41559-018-0572-9
+
+Revell, L. (2019). A follow-up comment on <code>phylo.to.map</code> for making &amp; plotting rightward-facing trees. Phylogenetic Tools for Comparative Biology. http://blog.phytools.org/2019/03/a-follow-up-comment-on-phylotomap-for.html 
+
+  
